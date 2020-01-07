@@ -1,0 +1,213 @@
+#!/usr/bin/env python
+
+import argparse
+import sys
+import re
+import os
+import os.path
+
+from urllib.parse import urljoin, urlparse, unquote
+from html.parser import HTMLParser
+
+import asyncio
+import aiohttp
+from aiohttp_socks import ProxyConnector
+from aiohttp_socks import SocksError
+
+
+class SearchResultsParser(HTMLParser):
+    """ HTML parser for the query results.
+        This needs rewrite with BeautifulSoup or something """
+
+    def __init__(self, baseurl):
+        self.htmlwhole = ""
+        self.curdata = ""
+        self.title = None
+        self.in_head = False
+        self.in_title = False
+        self.dlurls = []
+        self.nextpageurl = None  # if there are multiple pages
+        self.baseurl = baseurl
+
+        HTMLParser.__init__(self)
+
+    def getTitle(self):
+        return self.title
+
+    def getHtml(self):
+        return self.htmlwhole
+
+    def handle_data(self, data):
+        self.curdata += data
+        self.htmlwhole += data
+
+    def handle_starttag(self, tag, attrs):
+        self.curdata = ''
+        if tag == 'a':
+            href = None
+            for (key, value) in attrs:
+                if key == 'href':
+                    href = value
+            self.handle_link(href)
+
+        if tag == 'head':
+            self.in_head = True
+        if tag == 'title':
+            self.in_title = True
+
+    def handle_endtag(self, tag):
+        if tag == 'head':
+            self.in_head = False
+        if tag == 'title':
+            self.in_title = False
+            self.title = self.curdata
+
+    def handle_link(self, href):
+        if href and href.startswith('/download/'):
+            full_url = urljoin(self.baseurl, href)
+            self.dlurls.append(full_url)
+        if href and href.startswith('/search/?q='):
+            ma = re.search(r'\?q=.*?p=(\d*)', href)
+            if ma and self.nextpageurl is None:
+                self.nextpageurl = href
+
+
+async def chunked_download(resp, dstpath, chunk_size=64 * 1024):
+    bytes_sofar = 0
+
+    def show_progress(bytes_sofar, progress_line):
+        # Show a simple progress output to have some idea ..
+        # trantor doesn't send any content-length AFAIK
+        info_every = chunk_size * 8
+        div_rest = divmod(bytes_sofar, info_every)[1]
+        if progress_line:
+            sys.stdout.write('\b' * len(progress_line))
+        sys.stdout.write('\r')
+        prog = ''
+        if div_rest == 0:
+            prog = '*' * int(bytes_sofar / chunk_size) + '!'
+        else:
+            prog = '*' * int(bytes_sofar / chunk_size)
+        progress_line += prog
+        sys.stdout.write(prog)
+        sys.stdout.flush()
+
+    progress_line = ''
+    with open(dstpath, 'w+b') as fd:
+        while True:
+            chunk = await resp.content.read(chunk_size)
+            if not chunk:
+                break
+            bytes_sofar += len(chunk)
+            fd.write(chunk)
+            show_progress(bytes_sofar, progress_line)
+
+        sys.stdout.write('\n')
+        fd.close()
+
+
+async def fetch_epub(url, proxy, dstpath):
+    conn = ProxyConnector.from_url(proxy, rdns=True)
+
+    try:
+        async with aiohttp.ClientSession(connector=conn) as session:
+            async with session.get(url) as resp:
+                await chunked_download(resp, dstpath)
+
+    except aiohttp.ClientProxyConnectionError as e:
+        print("Proxy error", e, file=sys.stderr)
+    except aiohttp.ClientConnectorError as e:
+        print("Client connector error", e, file=sys.stderr)
+    except SocksError as e:
+        print("Socks error", e, file=sys.stderr)
+
+
+async def fetch_search_page(url, proxy, params):
+    conn = ProxyConnector.from_url(proxy, rdns=True)
+
+    async with aiohttp.ClientSession(connector=conn) as session:
+        async with session.get(url,
+                               params=params) as resp:
+            if resp.status == 200:
+                return await resp.text()
+
+
+def parse_search_results(baseurl, html):
+    parser = SearchResultsParser(baseurl)
+    parser.feed(html)
+    parser.close()
+    return parser
+
+
+async def trantor_dl(args):
+    socks_proxy_url = 'socks5://{0}:{1}'.format(args.sockshost,
+                                                int(args.socksport))
+    search_url = urljoin(args.trantorurl, '/search/')
+    search_query = None
+    params = {
+        'num': args.max,
+    }
+
+    if args.byname:
+        search_query = args.byname
+        params['q'] = search_query
+    elif args.bysubject:
+        search_query = args.bysubject
+        params['q'] = 'subject:{}'.format(search_query)
+    else:
+        return False
+
+    page = await fetch_search_page(search_url, socks_proxy_url, params)
+    if not page:
+        return False
+
+    parser = parse_search_results(args.trantorurl, page)
+    total_results = len(parser.dlurls)
+
+    for idx, url in enumerate(parser.dlurls):
+        parsed_url = urlparse(url)
+        epubname = unquote(os.path.basename(parsed_url.path))
+        sub_path = os.path.join(args.dstdir, search_query)
+        if not os.path.exists(sub_path):
+            os.mkdir(sub_path)
+        epubdst = os.path.join(sub_path, epubname)
+        if os.path.exists(epubdst):
+            continue
+        if args.interactive:
+            print('Download EPUB {} ? [y/n]'.format(epubname))
+            answer = sys.stdin.readline().strip()
+            if answer != 'y':
+                continue
+
+        print('[{0}/{1}] ** {2}'.format(idx + 1, total_results, epubdst))
+        await fetch_epub(url, socks_proxy_url, epubdst)
+
+    return True
+
+if __name__ == '__main__':
+    argsp = argparse.ArgumentParser()
+    argsp.add_argument('--trantorurl', metavar='str',
+                       default='http://xfmro77i3lixucja.onion',
+                       help='Trantor Library Onion URL')
+    argsp.add_argument(
+        '-i',
+        action='store_true',
+        dest='interactive',
+        help='Interactive mode, ask for confirmation')
+    argsp.add_argument('--dstdir', metavar='str',
+                       default='.', help='Output directory')
+    argsp.add_argument('--sockshost', metavar='str',
+                       default='localhost', help='Socks server hostname')
+    argsp.add_argument('--socksport', metavar='int',
+                       default=9050, help='Socks server port')
+    argsp.add_argument('--byname', metavar='str',
+                       default=None, help='Search ebooks by name')
+    argsp.add_argument('--bysubject', metavar='str',
+                       default=None, help='Search ebooks by subject')
+    argsp.add_argument('--max', metavar='int',
+                       default=20, help='Maximum ebooks to download')
+    args = argsp.parse_args()
+
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(trantor_dl(args))
+    loop.close()
