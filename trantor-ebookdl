@@ -15,6 +15,9 @@ from aiohttp_socks import ProxyConnector
 from aiohttp_socks import SocksError
 
 
+defaultOnionUrl = "http://kx5thpx2olielkihfyo4jgjqfb7zx7wxr3sd4xzt26ochei4m6f7tayd.onion"  # noqa
+
+
 class SearchResultsParser(HTMLParser):
     """ HTML parser for the query results.
         This needs rewrite with BeautifulSoup or something """
@@ -170,6 +173,8 @@ async def trantor_dl(args):
         sub_path = os.path.join(args.dstdir, search_query)
         if not os.path.exists(sub_path):
             os.mkdir(sub_path)
+
+        epubname = epubname.replace('/', '_')
         epubdst = os.path.join(sub_path, epubname)
         if os.path.exists(epubdst):
             continue
@@ -187,7 +192,7 @@ async def trantor_dl(args):
 if __name__ == '__main__':
     argsp = argparse.ArgumentParser()
     argsp.add_argument('--trantorurl', metavar='str',
-                       default='http://xfmro77i3lixucja.onion',
+                       default=defaultOnionUrl,
                        help='Trantor Library Onion URL')
     argsp.add_argument(
         '-i',
